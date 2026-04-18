@@ -139,38 +139,16 @@ setup_server() {
     step "Configuring sshd..."
     local SSHD="/etc/ssh/sshd_config"
 
-    # ── Remove GatewayPorts from ALL possible locations ──────────────────
-    step "Cleaning GatewayPorts from all sshd config locations..."
+    # ── Remove GatewayPorts from EVERY file under /etc/ssh/ ─────────────
+    step "Scanning all files under /etc/ssh/ for GatewayPorts..."
 
-    # 1. Main config file
-    sed -i "/^#*\s*GatewayPorts\b/Id" "$SSHD"
-
-    # 2. Drop-in directory (sshd_config.d/*.conf)
-    local dropins=()
-    for f in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config.d/*.cfg; do
+    while IFS= read -r f; do
         [[ -f "$f" ]] || continue
-        if grep -qi "GatewayPorts" "$f"; then
-            sed -i "/^#*\s*GatewayPorts\b/Id" "$f"
-            ok "  Cleaned: $f"
-        fi
-        dropins+=("$f")
-    done
+        sed -i "/^[[:space:]]*#*[[:space:]]*GatewayPorts\b/Id" "$f"
+        ok "  Cleaned: $f"
+    done < <(grep -rli "GatewayPorts" /etc/ssh/ 2>/dev/null)
 
-    # 3. Any Include directives pointing elsewhere
-    local includes
-    includes=$(grep -i "^Include" "$SSHD" | awk '{print $2}')
-    for pattern in $includes; do
-        for f in $pattern; do
-            [[ -f "$f" ]] || continue
-            if grep -qi "GatewayPorts" "$f"; then
-                sed -i "/^#*\s*GatewayPorts\b/Id" "$f"
-                ok "  Cleaned included file: $f"
-            fi
-        done
-    done
-
-    # 4. Write our value at the TOP of main config (before any Include)
-    #    so it takes precedence
+    # Write our value at the TOP of main config (wins over any Include below it)
     local tmp_sshd
     tmp_sshd=$(mktemp)
     echo "GatewayPorts clientspecified" > "$tmp_sshd"
