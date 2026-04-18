@@ -146,17 +146,20 @@ setup_server() {
         echo "${key} ${val}" >> "$SSHD"
     }
 
-    set_sshd "GatewayPorts"       "yes"
+    # "clientspecified" lets the client's explicit 0.0.0.0 in -R bind correctly.
+    set_sshd "GatewayPorts"       "clientspecified"
     set_sshd "AllowTcpForwarding"  "yes"
     set_sshd "ClientAliveInterval" "30"
     set_sshd "ClientAliveCountMax" "6"
-    systemctl restart sshd && ok "sshd restarted — GatewayPorts=yes active"
+    systemctl restart sshd && ok "sshd restarted"
 
-    # Verify GatewayPorts actually took effect
-    if sshd -T 2>/dev/null | grep -qi "gatewayports yes"; then
-        ok "Verified: GatewayPorts=yes is active"
+    # Verify
+    local gp_val
+    gp_val=$(sshd -T 2>/dev/null | grep -i "^gatewayports" | awk '{print $2}')
+    if [[ "$gp_val" == "clientspecified" || "$gp_val" == "yes" ]]; then
+        ok "Verified: GatewayPorts=${gp_val}"
     else
-        warn "Could not verify GatewayPorts — check sshd_config manually"
+        warn "GatewayPorts may not be active (got: '${gp_val}') — check: sshd -T | grep gatewayports"
     fi
 
     echo ""
@@ -223,16 +226,16 @@ setup_server() {
             break
         fi
 
-        # Show per-port status on one line
-        local status_line="  "
+        # Show per-port status on one line (no color codes inside printf)
+        local status_line=""
         for p in "${PORTS[@]}"; do
             if ss -tlnp 2>/dev/null | grep -q "0\.0\.0\.0:${p}"; then
-                status_line+="${GREEN}${p}✓${NC}  "
+                status_line+=" ${p}[UP]"
             else
-                status_line+="${RED}${p}…${NC}  "
+                status_line+=" ${p}[wait]"
             fi
         done
-        printf "\r  Waiting: %s  [%ds]   " "$status_line" "$elapsed"
+        printf "\r  [%3ds]%s   " "$elapsed" "$status_line"
 
         sleep 2
         (( elapsed += 2 ))
