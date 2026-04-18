@@ -147,7 +147,7 @@ setup_server() {
 
     # 2. Drop-in directory (sshd_config.d/*.conf)
     local dropins=()
-    for f in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config.d/*.cfg 2>/dev/null; do
+    for f in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config.d/*.cfg; do
         [[ -f "$f" ]] || continue
         if grep -qi "GatewayPorts" "$f"; then
             sed -i "/^#*\s*GatewayPorts\b/Id" "$f"
