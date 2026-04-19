@@ -2,12 +2,12 @@
 
 # =====================================================
 #   FluxTunnel — SSH Reverse Tunnel Manager
-#   Version : 0.2.0-beta
+#   Version : 0.3.0
 #   GitHub  : https://github.com/Aminroo/FluxTunnel
 #   Usage   : sudo bash setup.sh
 # =====================================================
 
-VERSION="0.2.0-beta"
+VERSION="0.3.0"
 REPO_RAW="https://raw.githubusercontent.com/Aminroo/FluxTunnel/main/setup.sh"
 REPO_VER="https://raw.githubusercontent.com/Aminroo/FluxTunnel/main/VERSION"
 
@@ -23,8 +23,10 @@ DIM='\033[2m'
 CONFIG_DIR="/etc/ssh-tunnel"
 TUNNELS_FILE="$CONFIG_DIR/tunnels.conf"
 AUTH_FILE="$CONFIG_DIR/auth.conf"
+KEY_FILE="$CONFIG_DIR/.enc_key"
 TUNNEL_SCRIPT="/usr/local/bin/ssh-tunnel"
 SERVICE_FILE="/etc/systemd/system/ssh-tunnel.service"
+MODE_FILE="$CONFIG_DIR/mode"   # "client" یا "server"
 
 # ─────────────────────────────────────────────────────
 #  Print helpers
@@ -58,6 +60,13 @@ ensure_config_dir() {
     [[ ! -f "$TUNNELS_FILE" ]] && touch "$TUNNELS_FILE"
     [[ ! -f "$AUTH_FILE"    ]] && touch "$AUTH_FILE"
     chmod 600 "$AUTH_FILE"
+    # ایجاد کلید رمزنگاری یکتا در اولین اجرا
+    if [[ ! -f "$KEY_FILE" ]]; then
+        openssl rand -hex 32 > "$KEY_FILE" 2>/dev/null || \
+            cat /proc/sys/kernel/random/uuid /proc/sys/kernel/random/uuid | sha256sum | awk '{print $1}' > "$KEY_FILE"
+        chmod 600 "$KEY_FILE"
+        ok "Encryption key generated: $KEY_FILE"
+    fi
 }
 
 # ─────────────────────────────────────────────────────
@@ -127,16 +136,20 @@ self_update() {
 }
 
 # ─────────────────────────────────────────────────────
-#  Password store — AES-256 با openssl
-#  کلید رمزنگاری از /etc/machine-id (یکتا روی هر ماشین)
-#  فایل: /etc/ssh-tunnel/auth.conf  chmod 600
-#  فرمت هر خط: HOST:PORT:USER:BASE64(AES_ENCRYPTED)
-#  اگه openssl نبود: plain:BASE64(plaintext)
+#  Password store — AES-256 با کلید تصادفی یکتا
+#  کلید در /etc/ssh-tunnel/.enc_key (chmod 600)
+#  فرمت هر خط: HOST:PORT:USER:ENC_DATA
 # ─────────────────────────────────────────────────────
 
 _enc_key() {
-    local mid; mid=$(cat /etc/machine-id 2>/dev/null || hostname)
-    printf '%s' "${mid}ssh-tunnel-key" | sha256sum | awk '{print $1}'
+    # کلید تصادفی یکتا که هنگام نصب ساخته شده
+    if [[ -f "$KEY_FILE" ]]; then
+        cat "$KEY_FILE"
+    else
+        # fallback اگه فایل کلید نبود
+        ensure_config_dir
+        cat "$KEY_FILE"
+    fi
 }
 
 save_password() {
@@ -146,17 +159,24 @@ save_password() {
 
     if command -v openssl &>/dev/null; then
         enc=$(printf '%s' "$pass" \
-            | openssl enc -aes-256-cbc -pbkdf2 -pass "pass:$(_enc_key)" 2>/dev/null \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
+              -pass "pass:$(_enc_key)" 2>/dev/null \
             | base64 -w0)
-        [[ -z "$enc" ]] && enc="plain:$(printf '%s' "$pass" | base64 -w0)"
+        if [[ -z "$enc" ]]; then
+            warn "openssl encryption failed — saving as plaintext"
+            enc="plain:$(printf '%s' "$pass" | base64 -w0)"
+        fi
     else
         warn "openssl not found — saving password as plaintext (chmod 600)"
         enc="plain:$(printf '%s' "$pass" | base64 -w0)"
     fi
 
-    sed -i "/^${host}:${port}:${user}:/d" "$AUTH_FILE" 2>/dev/null
-    echo "${key}:${enc}" >> "$AUTH_FILE"
-    chmod 600 "$AUTH_FILE"
+    # atomic write با فایل موقت
+    local tmp_auth; tmp_auth=$(mktemp "${AUTH_FILE}.XXXXXX")
+    grep -v "^${host}:${port}:${user}:" "$AUTH_FILE" 2>/dev/null > "$tmp_auth" || true
+    echo "${key}:${enc}" >> "$tmp_auth"
+    chmod 600 "$tmp_auth"
+    mv "$tmp_auth" "$AUTH_FILE"
     ok "Password saved to $AUTH_FILE"
 }
 
@@ -173,13 +193,17 @@ load_password() {
         printf '%s' "${enc#plain:}" | base64 -d 2>/dev/null
     else
         printf '%s' "$enc" | base64 -d 2>/dev/null \
-            | openssl enc -d -aes-256-cbc -pbkdf2 -pass "pass:$(_enc_key)" 2>/dev/null
+            | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+              -pass "pass:$(_enc_key)" 2>/dev/null
     fi
 }
 
 delete_password() {
     local host="$1" port="$2" user="$3"
-    sed -i "/^${host}:${port}:${user}:/d" "$AUTH_FILE" 2>/dev/null
+    local tmp_auth; tmp_auth=$(mktemp "${AUTH_FILE}.XXXXXX")
+    grep -v "^${host}:${port}:${user}:" "$AUTH_FILE" 2>/dev/null > "$tmp_auth" || true
+    chmod 600 "$tmp_auth"
+    mv "$tmp_auth" "$AUTH_FILE"
 }
 
 has_password() {
@@ -204,22 +228,31 @@ restart_sshd() {
 }
 
 # ─────────────────────────────────────────────────────
-#  Fix GatewayPorts
+#  Fix GatewayPorts — با backup
 # ─────────────────────────────────────────────────────
 
 fix_gateway_ports() {
     local SSHD="/etc/ssh/sshd_config"
+
+    # backup قبل از هر تغییر
+    cp "$SSHD" "${SSHD}.fluxtunnel.bak" 2>/dev/null && \
+        ok "Backup: ${SSHD}.fluxtunnel.bak"
+
     step "Scanning /etc/ssh/ for GatewayPorts conflicts..."
     while IFS= read -r f; do
         [[ -f "$f" ]] || continue
+        [[ "$f" == "$SSHD" ]] && continue  # فایل اصلی جداگانه مدیریت میشه
+        cp "$f" "${f}.fluxtunnel.bak" 2>/dev/null
         sed -i "/^[[:space:]]*#*[[:space:]]*GatewayPorts\b/Id" "$f"
         ok "  Cleaned: $f"
     done < <(grep -rli "GatewayPorts" /etc/ssh/ 2>/dev/null)
 
+    # حذف همه خطوط GatewayPorts از فایل اصلی و اضافه در بالا
     local tmp; tmp=$(mktemp)
     echo "GatewayPorts clientspecified" > "$tmp"
-    cat "$SSHD" >> "$tmp"
+    grep -v "^[[:space:]]*#*[[:space:]]*GatewayPorts\b" "$SSHD" >> "$tmp"
     mv "$tmp" "$SSHD"
+    chmod 600 "$SSHD"
     ok "GatewayPorts clientspecified → top of $SSHD"
 
     restart_sshd; sleep 1
@@ -275,6 +308,69 @@ port_bind_addr() {
 }
 
 # ─────────────────────────────────────────────────────
+#  SERVICE STATUS — تشخیص صحیح client یا server
+# ─────────────────────────────────────────────────────
+
+get_service_status() {
+    local mode=""
+    [[ -f "$MODE_FILE" ]] && mode=$(cat "$MODE_FILE")
+
+    if [[ "$mode" == "server" ]]; then
+        # روی VPS، سرویس tunnel نداریم — وضعیت پورت‌ها رو نشون بده
+        echo "server"
+    elif [[ "$mode" == "client" ]]; then
+        # روی ایران، سرویس systemd داریم
+        if systemctl is-active ssh-tunnel &>/dev/null; then
+            echo "running"
+        else
+            echo "stopped"
+        fi
+    else
+        # هنوز setup نشده
+        echo "not_configured"
+    fi
+}
+
+show_status_line() {
+    local mode=""
+    [[ -f "$MODE_FILE" ]] && mode=$(cat "$MODE_FILE")
+    local status; status=$(get_service_status)
+
+    case "$status" in
+        running)
+            echo -e "  Mode    : ${CYAN}${BOLD}CLIENT (Iran)${NC}"
+            echo -e "  Service : ${GREEN}${BOLD}RUNNING${NC}"
+            ;;
+        stopped)
+            echo -e "  Mode    : ${CYAN}${BOLD}CLIENT (Iran)${NC}"
+            echo -e "  Service : ${RED}${BOLD}STOPPED${NC}"
+            ;;
+        server)
+            echo -e "  Mode    : ${CYAN}${BOLD}SERVER (VPS/Kharej)${NC}"
+            # نمایش وضعیت پورت‌ها
+            local has_ports=0
+            if [[ -s "$TUNNELS_FILE" ]]; then
+                while IFS='|' read -r ID RU RH SP TP LP PC; do
+                    [[ -z "$ID" || "$ID" == \#* ]] && continue
+                    if port_on_all_interfaces "$TP" 2>/dev/null; then
+                        echo -e "  Port $TP : ${GREEN}${BOLD}OPEN (tunnel active)${NC}"
+                        has_ports=1
+                    else
+                        echo -e "  Port $TP : ${YELLOW}${BOLD}WAITING for client${NC}"
+                        has_ports=1
+                    fi
+                done < "$TUNNELS_FILE"
+            fi
+            [[ $has_ports -eq 0 ]] && echo -e "  Ports   : ${DIM}none configured${NC}"
+            ;;
+        not_configured)
+            echo -e "  Mode    : ${DIM}Not configured yet${NC}"
+            echo -e "  Service : ${DIM}N/A${NC}"
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────
 #  SERVER SETUP (VPS side)
 # ─────────────────────────────────────────────────────
 
@@ -320,6 +416,14 @@ setup_server() {
         else
             iptables -A INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null && ok "iptables: $p/tcp"
         fi
+    done
+
+    # ذخیره mode و پورت‌ها برای نمایش status
+    echo "server" > "$MODE_FILE"
+    # پاک کردن tunnels قدیمی و ذخیره پورت‌های جدید با فرمت مناسب server
+    > "$TUNNELS_FILE"
+    for (( i=0; i<${#PORTS[@]}; i++ )); do
+        echo "$((i+1))|server|localhost|22|${PORTS[$i]}|${PORTS[$i]}|" >> "$TUNNELS_FILE"
     done
 
     hr; ok "Server ready! Ports: ${PORTS[*]}"; echo ""
@@ -459,29 +563,38 @@ ask_auth() {
 copy_ssh_key() {
     local RU="$1" RH="$2" SP="$3" PC="$4" PASS="$5"
 
-    [[ ! -f ~/.ssh/id_rsa ]] && {
-        step "Generating SSH key..."
-        ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa -q && ok "SSH key created"
-    } || ok "SSH key: ~/.ssh/id_rsa"
+    [[ ! -f ~/.ssh/id_ed25519 ]] && [[ ! -f ~/.ssh/id_rsa ]] && {
+        step "Generating SSH key (ed25519)..."
+        ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q && ok "SSH key created: ~/.ssh/id_ed25519"
+    } || ok "SSH key: exists"
+
+    local KEY_PUB
+    if   [[ -f ~/.ssh/id_ed25519.pub ]]; then KEY_PUB=~/.ssh/id_ed25519.pub
+    elif [[ -f ~/.ssh/id_rsa.pub     ]]; then KEY_PUB=~/.ssh/id_rsa.pub
+    else err "No public key found"; return 1
+    fi
 
     if [[ -n "$PASS" ]] && ! command -v sshpass &>/dev/null; then
         install_deps
         if ! command -v sshpass &>/dev/null; then
             err "sshpass unavailable — add key manually:"
-            echo -e "  ${YELLOW}$(cat ~/.ssh/id_rsa.pub)${NC}"
+            echo -e "  ${YELLOW}$(cat "$KEY_PUB")${NC}"
             read -rp "  Press Enter after adding key: "; return
         fi
     fi
 
     step "Copying SSH key to ${RU}@${RH}..."
     local args=(); [[ -n "$PC" ]] && args+=(-o "$PC")
-    args+=(-o "StrictHostKeyChecking=no" -p "$SP")
+    # اولین بار با StrictHostKeyChecking=accept-new (ایمن‌تر از no)
+    args+=(-o "StrictHostKeyChecking=accept-new" -p "$SP")
 
     local ok_flag=0
     if [[ -n "$PASS" ]]; then
-        SSHPASS="$PASS" sshpass -e ssh-copy-id "${args[@]}" "${RU}@${RH}" && ok_flag=1
+        # پسورد از stdin به sshpass میره، نه از env
+        echo "$PASS" | sshpass ssh-copy-id -f -i "$KEY_PUB" "${args[@]}" "${RU}@${RH}" 2>/dev/null \
+            && ok_flag=1
     else
-        ssh-copy-id "${args[@]}" "${RU}@${RH}" && ok_flag=1
+        ssh-copy-id -f -i "$KEY_PUB" "${args[@]}" "${RU}@${RH}" && ok_flag=1
     fi
 
     if [[ $ok_flag -eq 1 ]]; then
@@ -492,7 +605,7 @@ copy_ssh_key() {
         fi
     else
         warn "ssh-copy-id failed — add key manually:"
-        echo -e "  ${YELLOW}$(cat ~/.ssh/id_rsa.pub)${NC}"
+        echo -e "  ${YELLOW}$(cat "$KEY_PUB")${NC}"
         read -rp "  Press Enter after adding key: "
     fi
 }
@@ -502,7 +615,7 @@ wait_for_connection() {
     step "Testing SSH to ${RH}:${SP}..."
     for (( i=1; i<=60; i++ )); do
         local args=(); [[ -n "$PC" ]] && args+=(-o "$PC")
-        args+=(-o "StrictHostKeyChecking=no" -o "ConnectTimeout=5" -o "BatchMode=yes" -p "$SP")
+        args+=(-o "StrictHostKeyChecking=accept-new" -o "ConnectTimeout=5" -o "BatchMode=yes" -p "$SP")
         ssh "${args[@]}" "${RU}@${RH}" "exit" 2>/dev/null \
             && { echo ""; ok "Connected to ${RH}!"; return 0; }
         printf "\r  Attempt %d/60..." "$i"; sleep 1
@@ -511,33 +624,55 @@ wait_for_connection() {
 }
 
 # ─────────────────────────────────────────────────────
+#  Monitor port — بدون تداخل
+#  هر tunnel یه port مانیتور یکتا میگیره بر اساس ID
+# ─────────────────────────────────────────────────────
+
+_monitor_port() {
+    local id="$1"
+    # رنج 20200-20299 برای مانیتور (حداکثر 20 tunnel)
+    echo $(( 20200 + (id % 100) ))
+}
+
+# ─────────────────────────────────────────────────────
 #  Tunnel runner — autossh با fallback کامل
+#  FIX: لاگ با flock برای thread safety
+#  FIX: پسورد از stdin نه env
+#  FIX: monitor port یکتا
 # ─────────────────────────────────────────────────────
 
 generate_tunnel_script() {
     step "Generating tunnel runner..."
     cat > "$TUNNEL_SCRIPT" << 'SCRIPT_EOF'
 #!/bin/bash
-# Auto-generated by FluxTunnel — do not edit manually
+# Auto-generated by FluxTunnel v0.3.0 — do not edit manually
 CONFIG_DIR="/etc/ssh-tunnel"
 TUNNELS_FILE="$CONFIG_DIR/tunnels.conf"
 AUTH_FILE="$CONFIG_DIR/auth.conf"
+KEY_FILE="$CONFIG_DIR/.enc_key"
 LOG_FILE="$CONFIG_DIR/tunnel.log"
+LOCK_FILE="$CONFIG_DIR/tunnel.lock"
 MAX_LOG=2000
 
 log() {
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') $1"
-    echo "$msg" | tee -a "$LOG_FILE"
-    local cnt; cnt=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
-    if (( cnt > MAX_LOG )); then
-        tail -n $((MAX_LOG/2)) "$LOG_FILE" > "${LOG_FILE}.tmp" \
-            && mv "${LOG_FILE}.tmp" "$LOG_FILE"
-    fi
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    # flock برای جلوگیری از race condition
+    (
+        flock -w 2 200
+        echo "$msg" >> "$LOG_FILE"
+        local cnt; cnt=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+        if (( cnt > MAX_LOG )); then
+            local tmp; tmp=$(mktemp "${LOG_FILE}.XXXXXX")
+            tail -n $((MAX_LOG/2)) "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
+        fi
+    ) 200>"$LOCK_FILE"
 }
 
 _enc_key() {
+    [[ -f "$KEY_FILE" ]] && cat "$KEY_FILE" && return
+    # اگه کلید نبود، از machine-id به عنوان fallback
     local mid; mid=$(cat /etc/machine-id 2>/dev/null || hostname)
-    printf '%s' "${mid}ssh-tunnel-key" | sha256sum | awk '{print $1}'
+    printf '%s' "${mid}ssh-tunnel-key-fallback" | sha256sum | awk '{print $1}'
 }
 
 load_password() {
@@ -550,20 +685,22 @@ load_password() {
         printf '%s' "${enc#plain:}" | base64 -d 2>/dev/null
     else
         printf '%s' "$enc" | base64 -d 2>/dev/null \
-            | openssl enc -d -aes-256-cbc -pbkdf2 -pass "pass:$(_enc_key)" 2>/dev/null
+            | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+              -pass "pass:$(_enc_key)" 2>/dev/null
     fi
 }
 
 run_tunnel() {
     IFS='|' read -r ID RU RH SP TP LP PC <<< "$1"
 
-    local MON=$(( 20100 + (TP % 900) ))
+    # monitor port یکتا بر اساس ID
+    local MON=$(( 20200 + (ID % 100) ))
 
     local BASE_OPTS=(
         -o "ServerAliveInterval=10"
         -o "ServerAliveCountMax=3"
         -o "ExitOnForwardFailure=yes"
-        -o "StrictHostKeyChecking=no"
+        -o "StrictHostKeyChecking=accept-new"
         -o "ConnectTimeout=15"
         -o "TCPKeepAlive=yes"
         -o "BatchMode=yes"
@@ -573,17 +710,21 @@ run_tunnel() {
     [[ -n "$PC" ]] && BASE_OPTS+=(-o "$PC")
 
     _ssh_once() {
+        # اول بدون پسورد (key-based)
         ssh -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null && return 0
+
+        # اگه key کار نکرد، از پسورد ذخیره شده استفاده کن
         local pass; pass=$(load_password "$RH" "$SP" "$RU" 2>/dev/null)
         if [[ -n "$pass" ]] && command -v sshpass &>/dev/null; then
-            SSHPASS="$pass" sshpass -e ssh -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null \
+            # پسورد از stdin به sshpass میره
+            echo "$pass" | sshpass ssh -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null \
                 && return 0
         fi
         return 1
     }
 
     if command -v autossh &>/dev/null; then
-        log "[T${ID}] autossh → ${RH}:${TP} (mon:${MON})"
+        log "[T${ID}] Starting autossh → ${RH}:${TP} (monitor:${MON})"
         while true; do
             AUTOSSH_GATETIME=0 \
             AUTOSSH_POLL=10 \
@@ -591,26 +732,33 @@ run_tunnel() {
             AUTOSSH_MAXSTART=0 \
             AUTOSSH_LOGFILE="" \
                 autossh -M "$MON" -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null
-            log "[T${ID}] autossh exited — retry in 3s..."
+            local exit_code=$?
+            log "[T${ID}] autossh exited (code=${exit_code}) — retry in 3s..."
             sleep 3
         done
     else
-        log "[T${ID}] ssh fallback loop → ${RH}:${TP}"
+        log "[T${ID}] Starting ssh fallback loop → ${RH}:${TP}"
+        local backoff=5
         while true; do
-            log "[T${ID}] Connecting..."
-            _ssh_once
-            log "[T${ID}] Disconnected — retry in 5s..."
-            sleep 5
+            log "[T${ID}] Connecting to ${RH}:${TP}..."
+            if _ssh_once; then
+                backoff=5  # reset backoff پس از اتصال موفق
+            fi
+            log "[T${ID}] Disconnected — retry in ${backoff}s..."
+            sleep "$backoff"
+            # exponential backoff تا حداکثر 60 ثانیه
+            (( backoff = backoff < 60 ? backoff * 2 : 60 ))
         done
     fi
 }
 
+# Launch all tunnels
 while IFS= read -r line; do
     [[ -z "$line" || "$line" == \#* ]] && continue
     run_tunnel "$line" &
 done < "$TUNNELS_FILE"
 
-log "All tunnels launched (PID $$)"
+log "FluxTunnel started — all tunnels launched (PID $$)"
 wait
 SCRIPT_EOF
     chmod +x "$TUNNEL_SCRIPT"
@@ -690,10 +838,18 @@ setup_client() {
         || { err "Connection failed — aborting"; exit 1; }
 
     step "Saving tunnel config..."
+    # ذخیره config با atomic write
+    local tmp_cfg; tmp_cfg=$(mktemp "${TUNNELS_FILE}.XXXXXX")
+    # کپی خطوط موجود
+    [[ -s "$TUNNELS_FILE" ]] && cat "$TUNNELS_FILE" > "$tmp_cfg" || true
     for entry in "${ENTRIES[@]}"; do
-        echo "$entry" >> "$TUNNELS_FILE"
+        echo "$entry" >> "$tmp_cfg"
     done
+    mv "$tmp_cfg" "$TUNNELS_FILE"
     ok "Config: $TUNNELS_FILE"
+
+    # ذخیره mode
+    echo "client" > "$MODE_FILE"
 
     generate_tunnel_script
     generate_service
@@ -721,19 +877,34 @@ list_tunnels() {
     if [[ ! -s "$TUNNELS_FILE" ]]; then
         warn "No tunnels configured."; return 1
     fi
+
+    local mode=""
+    [[ -f "$MODE_FILE" ]] && mode=$(cat "$MODE_FILE")
+
     echo -e "  ${BOLD}Configured Tunnels:${NC}"
     hr
     printf "  %-4s %-22s %-10s %-13s %-12s %-8s %-6s %s\n" \
         "#" "Remote Host" "SSH Port" "Tunnel Port" "Local Port" "Proxy" "PW" "Status"
     hr
+
     local i=1
     while IFS='|' read -r ID RU RH SP TP LP PC; do
         [[ -z "$ID" || "$ID" == \#* ]] && continue
+        [[ "$mode" == "server" && "$RH" == "localhost" ]] && RH="(this server)"
         local proxy="none"; [[ -n "$PC" ]] && proxy="socks5"
         local pw_st; has_password "$RH" "$SP" "$RU" && pw_st="${GREEN}yes${NC}" || pw_st="${DIM}no${NC}"
+
         local svc_st
-        systemctl is-active ssh-tunnel &>/dev/null \
-            && svc_st="${GREEN}active${NC}" || svc_st="${RED}stopped${NC}"
+        if [[ "$mode" == "client" ]]; then
+            systemctl is-active ssh-tunnel &>/dev/null \
+                && svc_st="${GREEN}active${NC}" || svc_st="${RED}stopped${NC}"
+        elif [[ "$mode" == "server" ]]; then
+            port_on_all_interfaces "$TP" 2>/dev/null \
+                && svc_st="${GREEN}port open${NC}" || svc_st="${YELLOW}waiting${NC}"
+        else
+            svc_st="${DIM}N/A${NC}"
+        fi
+
         printf "  %-4s %-22s %-10s %-13s %-12s %-8s " "$i" "$RH" "$SP" "$TP" "$LP" "$proxy"
         echo -e "${pw_st}  ${svc_st}"
         (( i++ ))
@@ -745,7 +916,8 @@ delete_tunnel() {
     list_tunnels || return
     read -rp "  Tunnel # to delete (0=cancel): " N
     [[ "$N" == "0" || -z "$N" ]] && return
-    local i=1 NEW=""
+    local i=1
+    local tmp_cfg; tmp_cfg=$(mktemp "${TUNNELS_FILE}.XXXXXX")
     while IFS='|' read -r ID RU RH SP TP LP PC; do
         [[ -z "$ID" || "$ID" == \#* ]] && continue
         if [[ "$i" -eq "$N" ]]; then
@@ -753,20 +925,27 @@ delete_tunnel() {
             read -rp "  Also delete saved password for ${RU}@${RH}? [y/N]: " dp
             [[ "${dp,,}" == "y" ]] && delete_password "$RH" "$SP" "$RU" && ok "Password removed"
         else
-            NEW+="${ID}|${RU}|${RH}|${SP}|${TP}|${LP}|${PC}\n"
+            echo "${ID}|${RU}|${RH}|${SP}|${TP}|${LP}|${PC}" >> "$tmp_cfg"
         fi
         (( i++ ))
     done < "$TUNNELS_FILE"
-    printf "%b" "$NEW" > "$TUNNELS_FILE"
-    generate_tunnel_script
-    systemctl restart ssh-tunnel && ok "Service restarted"
+    mv "$tmp_cfg" "$TUNNELS_FILE"
+
+    local mode=""
+    [[ -f "$MODE_FILE" ]] && mode=$(cat "$MODE_FILE")
+    if [[ "$mode" == "client" ]]; then
+        generate_tunnel_script
+        systemctl restart ssh-tunnel && ok "Service restarted"
+    fi
 }
 
 edit_tunnel() {
     list_tunnels || return
     read -rp "  Tunnel # to edit (0=cancel): " N
     [[ "$N" == "0" || -z "$N" ]] && return
-    local i=1 FOUND=0 NEW=""
+    local i=1 FOUND=0
+    local tmp_cfg; tmp_cfg=$(mktemp "${TUNNELS_FILE}.XXXXXX")
+
     while IFS='|' read -r ID RU RH SP TP LP PC; do
         [[ -z "$ID" || "$ID" == \#* ]] && continue
         if [[ "$i" -eq "$N" ]]; then
@@ -783,12 +962,18 @@ edit_tunnel() {
                 && echo -e "  ${DIM}Password: saved ✓${NC}" \
                 || echo -e "  ${DIM}Password: not saved${NC}"
             read -rsp "  New password (Enter=keep, type 'clear'=remove): " new_pw; echo ""
+
+            # atomic: اول اطلاعات جدید ذخیره، بعد قدیمی حذف
             if [[ "$new_pw" == "clear" ]]; then
-                delete_password "$OLD_RH" "$OLD_SP" "$OLD_RU"; ok "Password cleared"
+                delete_password "$OLD_RH" "$OLD_SP" "$OLD_RU"
+                ok "Password cleared"
             elif [[ -n "$new_pw" ]]; then
-                [[ "$OLD_RH$OLD_SP$OLD_RU" != "$RH$SP$RU" ]] \
-                    && delete_password "$OLD_RH" "$OLD_SP" "$OLD_RU"
+                # اول ذخیره جدید
                 save_password "$RH" "$SP" "$RU" "$new_pw"
+                # بعد حذف قدیمی (اگه key عوض شده)
+                if [[ "$OLD_RH$OLD_SP$OLD_RU" != "$RH$SP$RU" ]]; then
+                    delete_password "$OLD_RH" "$OLD_SP" "$OLD_RU"
+                fi
             fi
 
             local cur_p="none"; [[ -n "$PC" ]] && cur_p="$PC"
@@ -798,17 +983,27 @@ edit_tunnel() {
             elif [[ -n "$NP" ]]; then PC="ProxyCommand=nc -x ${NP%:*}:${NP##*:} -X 5 %h %p"
             fi
 
-            NEW+="${N}|${RU}|${RH}|${SP}|${TP}|${LP}|${PC}\n"
+            echo "${N}|${RU}|${RH}|${SP}|${TP}|${LP}|${PC}" >> "$tmp_cfg"
             ok "Tunnel #${N} updated"
         else
-            NEW+="${ID}|${RU}|${RH}|${SP}|${TP}|${LP}|${PC}\n"
+            echo "${ID}|${RU}|${RH}|${SP}|${TP}|${LP}|${PC}" >> "$tmp_cfg"
         fi
         (( i++ ))
     done < "$TUNNELS_FILE"
-    [[ $FOUND -eq 0 ]] && { err "Not found"; return; }
-    printf "%b" "$NEW" > "$TUNNELS_FILE"
-    generate_tunnel_script
-    systemctl restart ssh-tunnel && ok "Service restarted"
+
+    if [[ $FOUND -eq 0 ]]; then
+        rm -f "$tmp_cfg"
+        err "Not found"; return
+    fi
+
+    mv "$tmp_cfg" "$TUNNELS_FILE"
+
+    local mode=""
+    [[ -f "$MODE_FILE" ]] && mode=$(cat "$MODE_FILE")
+    if [[ "$mode" == "client" ]]; then
+        generate_tunnel_script
+        systemctl restart ssh-tunnel && ok "Service restarted"
+    fi
 }
 
 manage_passwords() {
@@ -885,11 +1080,7 @@ main() {
     while true; do
         banner
 
-        if systemctl is-active ssh-tunnel &>/dev/null; then
-            echo -e "  Service : ${GREEN}${BOLD}RUNNING${NC}"
-        else
-            echo -e "  Service : ${RED}${BOLD}STOPPED${NC}"
-        fi
+        show_status_line
         local tcnt; tcnt=$(grep -c "^[^#]" "$TUNNELS_FILE" 2>/dev/null || echo 0)
         echo -e "  Tunnels : ${BOLD}${tcnt}${NC} configured"
 
@@ -914,8 +1105,34 @@ main() {
             4)  edit_tunnel;   read -rp "  [Enter to continue]" ;;
             5)  delete_tunnel; read -rp "  [Enter to continue]" ;;
             6)  manage_passwords ;;
-            7)  systemctl restart ssh-tunnel && ok "Restarted"; sleep 1 ;;
-            8)  echo -e "  ${DIM}Ctrl+C to exit${NC}"; journalctl -u ssh-tunnel -f ;;
+            7)
+                local mode=""
+                [[ -f "$MODE_FILE" ]] && mode=$(cat "$MODE_FILE")
+                if [[ "$mode" == "client" ]]; then
+                    systemctl restart ssh-tunnel && ok "Restarted"; sleep 1
+                elif [[ "$mode" == "server" ]]; then
+                    warn "Server mode — no tunnel service to restart"
+                    info "Restart sshd? (y/N): "; read -rp "" rr
+                    [[ "${rr,,}" == "y" ]] && restart_sshd
+                else
+                    warn "Not configured yet"
+                fi
+                sleep 1
+                ;;
+            8)
+                local mode=""
+                [[ -f "$MODE_FILE" ]] && mode=$(cat "$MODE_FILE")
+                if [[ "$mode" == "client" ]]; then
+                    echo -e "  ${DIM}Ctrl+C to exit${NC}"
+                    journalctl -u ssh-tunnel -f
+                elif [[ "$mode" == "server" ]]; then
+                    echo -e "  ${DIM}Showing sshd logs — Ctrl+C to exit${NC}"
+                    journalctl -u ssh -f 2>/dev/null || journalctl -u sshd -f
+                else
+                    warn "Not configured yet"
+                    sleep 1
+                fi
+                ;;
             9)  self_update ;;
             10) uninstall_all ;;
             0)  echo ""; exit 0 ;;
