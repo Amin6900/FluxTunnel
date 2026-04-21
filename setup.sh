@@ -624,17 +624,6 @@ wait_for_connection() {
 }
 
 # ─────────────────────────────────────────────────────
-#  Monitor port — بدون تداخل
-#  هر tunnel یه port مانیتور یکتا میگیره بر اساس ID
-# ─────────────────────────────────────────────────────
-
-_monitor_port() {
-    local id="$1"
-    # رنج 20200-20299 برای مانیتور (حداکثر 20 tunnel)
-    echo $(( 20200 + (id % 100) ))
-}
-
-# ─────────────────────────────────────────────────────
 #  Tunnel runner — autossh با fallback کامل
 #  FIX: لاگ با flock برای thread safety
 #  FIX: پسورد از stdin نه env
@@ -693,13 +682,9 @@ load_password() {
 run_tunnel() {
     IFS='|' read -r ID RU RH SP TP LP PC <<< "$1"
 
-    # monitor port یکتا بر اساس ID
-    local MON=$(( 20200 + (ID % 100) ))
-
     # ─── ساخت ssh_config موقت برای این tunnel ───
-    # مشکل: پاس دادن ProxyCommand از طریق -o در آرایه bash
-    # باعث میشه autossh نتونه مسیر nc رو پیدا کنه (No such file or directory)
     # راه‌حل: نوشتن همه تنظیمات در یه فایل ssh_config موقت
+    # ProxyCommand در -o با autossh مشکل داره، اینجا درست کار می‌کنه
     local SSH_CFG="${CONFIG_DIR}/ssh_t${ID}.conf"
     {
         echo "Host ${RH}"
@@ -727,6 +712,9 @@ run_tunnel() {
         -R "0.0.0.0:${TP}:127.0.0.1:${LP}"
     )
 
+    # پیدا کردن مسیر ssh برای autossh
+    local SSH_BIN; SSH_BIN=$(command -v ssh)
+
     _ssh_once() {
         # اول بدون پسورد (key-based)
         ssh -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null && return 0
@@ -740,15 +728,19 @@ run_tunnel() {
         return 1
     }
 
-    if command -v autossh &>/dev/null; then
-        log "[T${ID}] Starting autossh → ${RH}:${TP} (monitor:${MON}, cfg:${SSH_CFG})"
+    if command -v autossh &>/dev/null && [[ -n "$SSH_BIN" ]]; then
+        # -M 0: غیرفعال کردن monitor port جداگانه
+        # دلیل: autossh با -M PORT یه connection جداگانه می‌زنه که proxy نداره → fail
+        # ServerAliveInterval در ssh_config وظیفه health-check رو داره
+        log "[T${ID}] Starting autossh -M 0 → ${RH}:${TP} (cfg:${SSH_CFG})"
         while true; do
             AUTOSSH_GATETIME=0 \
             AUTOSSH_POLL=10 \
             AUTOSSH_FIRST_POLL=30 \
             AUTOSSH_MAXSTART=0 \
             AUTOSSH_LOGFILE="" \
-                autossh -M "$MON" -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null
+            AUTOSSH_PATH="$SSH_BIN" \
+                autossh -M 0 -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null
             local exit_code=$?
             log "[T${ID}] autossh exited (code=${exit_code}) — retry in 3s..."
             sleep 3
