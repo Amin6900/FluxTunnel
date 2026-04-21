@@ -712,52 +712,38 @@ run_tunnel() {
         -R "0.0.0.0:${TP}:127.0.0.1:${LP}"
     )
 
-    # پیدا کردن مسیر ssh برای autossh
-    local SSH_BIN; SSH_BIN=$(command -v ssh)
+    # autossh با ProxyCommand در -F ssh_config سازگار نیست (No such file or directory)
+    # راه‌حل: ssh مستقیم با reconnect loop — ServerAliveInterval وظیفه health-check داره
+    log "[T${ID}] Starting ssh loop → ${RH}:${TP} (cfg:${SSH_CFG})"
+    local backoff=5
+    while true; do
+        log "[T${ID}] Connecting..."
 
-    _ssh_once() {
-        # اول بدون پسورد (key-based)
-        ssh -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null && return 0
+        # اول key-based (BatchMode=yes در ssh_config)
+        ssh -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null
+        local exit_code=$?
 
-        # اگه key کار نکرد، از پسورد ذخیره شده استفاده کن
-        local pass; pass=$(load_password "$RH" "$SP" "$RU" 2>/dev/null)
-        if [[ -n "$pass" ]] && command -v sshpass &>/dev/null; then
-            echo "$pass" | sshpass ssh -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null \
-                && return 0
-        fi
-        return 1
-    }
-
-    if command -v autossh &>/dev/null && [[ -n "$SSH_BIN" ]]; then
-        # -M 0: غیرفعال کردن monitor port جداگانه
-        # دلیل: autossh با -M PORT یه connection جداگانه می‌زنه که proxy نداره → fail
-        # ServerAliveInterval در ssh_config وظیفه health-check رو داره
-        log "[T${ID}] Starting autossh -M 0 → ${RH}:${TP} (cfg:${SSH_CFG})"
-        while true; do
-            AUTOSSH_GATETIME=0 \
-            AUTOSSH_POLL=10 \
-            AUTOSSH_FIRST_POLL=30 \
-            AUTOSSH_MAXSTART=0 \
-            AUTOSSH_LOGFILE="" \
-            AUTOSSH_PATH="$SSH_BIN" \
-                autossh -M 0 -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null
-            local exit_code=$?
-            log "[T${ID}] autossh exited (code=${exit_code}) — retry in 3s..."
-            sleep 3
-        done
-    else
-        log "[T${ID}] Starting ssh fallback loop → ${RH}:${TP}"
-        local backoff=5
-        while true; do
-            log "[T${ID}] Connecting to ${RH}:${TP}..."
-            if _ssh_once; then
-                backoff=5
+        # اگه key کار نکرد، پسورد رو امتحان کن
+        if [[ $exit_code -ne 0 ]]; then
+            local pass; pass=$(load_password "$RH" "$SP" "$RU" 2>/dev/null)
+            if [[ -n "$pass" ]] && command -v sshpass &>/dev/null; then
+                echo "$pass" | sshpass ssh -N "${BASE_OPTS[@]}" \
+                    -o BatchMode=no "${RU}@${RH}" 2>/dev/null
+                exit_code=$?
             fi
+        fi
+
+        if [[ $exit_code -eq 0 ]]; then
+            # اتصال بود و قطع شد — backoff رو ریست کن
+            backoff=5
             log "[T${ID}] Disconnected — retry in ${backoff}s..."
-            sleep "$backoff"
-            (( backoff = backoff < 60 ? backoff * 2 : 60 ))
-        done
-    fi
+        else
+            log "[T${ID}] Connect failed (code=${exit_code}) — retry in ${backoff}s..."
+        fi
+
+        sleep "$backoff"
+        (( backoff = backoff < 60 ? backoff * 2 : 60 ))
+    done
 }
 
 # Launch all tunnels
